@@ -96,6 +96,99 @@ func getRowsList(db *sql.DB, tableName string, offset int, limit int) ([]SR, err
 	return records, nil
 }
 
+func getPrimaryColumnName(db *sql.DB, tableName string) (string, error) {
+	rows, err := db.Query(fmt.Sprintf(`SHOW FULL COLUMNS FROM %s`, tableName))
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			Field      string
+			Type       interface{}
+			Collation  interface{}
+			Null       interface{}
+			Key        string
+			Default    interface{}
+			Extra      interface{}
+			Privileges interface{}
+			Comment    interface{}
+		)
+		if err := rows.Scan(&Field, &Type, &Collation, &Null, &Key, &Default, &Extra, &Privileges, &Comment); err != nil {
+			return "", err
+		}
+		if Key != "PRI" {
+			continue
+		}
+		return Field, nil
+	}
+	return "", err
+}
+
+func getRowDetail(db *sql.DB, tableName string, rowId int) (SR, error) {
+	columnNamePK, err := getPrimaryColumnName(db, tableName)
+	if err != nil {
+		return nil, err
+	}
+	var records []SR
+	rows, err := db.Query(fmt.Sprintf(`SELECT * FROM %[1]s WHERE %[2]s = ?`, tableName, columnNamePK), rowId)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	columns, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+	items := make([]interface{}, len(columns))
+	itemsRelated := make([]interface{}, len(columns))
+	for rows.Next() {
+		record := SR{}
+		for i := range columns {
+			items[i] = &itemsRelated[i]
+		}
+		if err := rows.Scan(items...); err != nil {
+			return nil, err
+		}
+		for i, column := range columns {
+			if itemsRelated[i] == nil {
+				record[column] = nil
+				continue
+			}
+			intValue64, ok := itemsRelated[i].(int64)
+			if ok {
+				record[column] = intValue64
+				continue
+			}
+			intValue32, ok := itemsRelated[i].(int32)
+			if ok {
+				record[column] = intValue32
+				continue
+			}
+			byteValue, ok := itemsRelated[i].([]byte)
+			if ok {
+				record[column] = string(byteValue)
+				continue
+			}
+			floatValue64, ok := itemsRelated[i].(float64)
+			if ok {
+				record[column] = floatValue64
+				continue
+			}
+			floatValue32, ok := itemsRelated[i].(float32)
+			if ok {
+				record[column] = floatValue32
+				continue
+			}
+		}
+		records = append(records, record)
+	}
+	if len(records) == 0 {
+		return nil, nil
+	}
+	return records[0], nil
+}
+
 func tableListHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	tableNames, err := getTableList(db)
 	if err != nil {
@@ -167,12 +260,62 @@ func tableDetailHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	return
 }
 
+func rowDetailHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
+	tableNames, err := getTableList(db)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	reTableName := regexp.MustCompile(`(?P<tablename>\w+)`)
+	matchStrings := reTableName.FindAllString(r.URL.Path, 2)
+	if len(matchStrings) > 0 {
+		currTableName := matchStrings[0]
+		if !contains(tableNames, currTableName) {
+			w.WriteHeader(http.StatusNotFound)
+			responseJson, _ := json.Marshal(SR{
+				"error": "unknown table",
+			})
+			w.Write(responseJson)
+			return
+		}
+		currRowId, err := strconv.Atoi(matchStrings[1])
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		SRRow, err := getRowDetail(db, currTableName, currRowId)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		if SRRow == nil {
+			w.WriteHeader(http.StatusNotFound)
+			responseJson, _ := json.Marshal(SR{
+				"error": "record not found",
+			})
+			w.Write(responseJson)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		responseJson, _ := json.Marshal(SR{
+			"response": SR{
+				"record": SRRow,
+			},
+		})
+		w.Write(responseJson)
+		return
+	}
+	w.WriteHeader(http.StatusInternalServerError)
+	return
+}
+
 func mainHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
-	reTableDetail := regexp.MustCompile(`/[\w?=&]+`)
 	if r.URL.Path == "/" {
 		tableListHandler(w, r, db)
-	} else if r.Method == "GET" && reTableDetail.MatchString(r.URL.Path) && strings.Count(r.URL.Path, "/") == 1 {
+	} else if r.Method == "GET" && strings.Count(r.URL.Path, "/") == 1 {
 		tableDetailHandler(w, r, db)
+	} else if r.Method == "GET" && strings.Count(r.URL.Path, "/") == 2 {
+		rowDetailHandler(w, r, db)
 	} else {
 		w.WriteHeader(http.StatusInternalServerError)
 	}
