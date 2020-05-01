@@ -357,9 +357,46 @@ func rowCreateHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 			w.Write(responseJson)
 			return
 		}
+		idCreated, err := createRow(db, currTableName, bodyMap)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		responseJson, _ := json.Marshal(SR{
+			"response": SR{
+				"id": idCreated,
+			},
+		})
+		w.Write(responseJson)
+		return
 	}
 	w.WriteHeader(http.StatusInternalServerError)
 	return
+}
+
+func createRow(db *sql.DB, tableName string, bodyMap map[string]interface{}) (int, error) {
+	columnNames := make([]string, 0, len(bodyMap))
+	columnValues := make([]interface{}, 0, len(bodyMap))
+	questionMark := make([]string, 0, len(bodyMap))
+	for key, value := range bodyMap {
+		columnNames = append(columnNames, key)
+		columnValues = append(columnValues, value)
+		questionMark = append(questionMark, "?")
+	}
+	result, err := db.Exec(fmt.Sprintf(`INSERT INTO %[1]s (%[2]s) VALUES(%[3]s);`,
+		tableName,
+		strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(fmt.Sprintf("%s", columnNames), "[", ""), "]", ""), " ", ","),
+		strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(fmt.Sprintf("%s", questionMark), "[", ""), "]", ""), " ", ","),
+	), columnValues...)
+	if err != nil {
+		return 0, err
+	}
+	lastInsertId, err := result.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+	return int(lastInsertId), nil
 }
 
 func rowDetailHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
