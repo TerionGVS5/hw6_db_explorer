@@ -259,16 +259,14 @@ func tableDetailHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		if limitParam != "" {
 			levelParam64, levelParamErr := strconv.ParseInt(limitParam, 10, 64)
 			if levelParamErr != nil {
-				w.WriteHeader(http.StatusInternalServerError)
-				return
+				levelParam64 = 5
 			}
 			limit = int(levelParam64)
 		}
 		if offsetParam != "" {
 			offsetParam64, offsetParamErr := strconv.ParseInt(offsetParam, 10, 64)
 			if offsetParamErr != nil {
-				w.WriteHeader(http.StatusInternalServerError)
-				return
+				offsetParam64 = 0
 			}
 			offset = int(offsetParam64)
 		}
@@ -290,6 +288,34 @@ func tableDetailHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	return
 }
 
+func addFieldToCreate(bodyMap *map[string]interface{}, typesForColumns map[string]string) {
+	existFields := make([]string, len(*bodyMap))
+	for key := range *bodyMap {
+		existFields = append(existFields, key)
+	}
+	for key, value := range typesForColumns {
+		if !contains(existFields, key) && strings.Contains(value, "NO") {
+			if strings.Contains(value, "text") || strings.Contains(value, "varchar") {
+				(*bodyMap)[key] = ""
+			} else {
+				(*bodyMap)[key] = 0
+			}
+		}
+	}
+}
+
+func removeUnknownFields(bodyMap *map[string]interface{}, typesForColumns map[string]string) {
+	existFields := make([]string, len(typesForColumns))
+	for key := range typesForColumns {
+		existFields = append(existFields, key)
+	}
+	for key := range *bodyMap {
+		if !contains(existFields, key) {
+			delete(*bodyMap, key)
+		}
+	}
+}
+
 func findInvalidTypeField(bodyMap map[string]interface{}, typesForColumns map[string]string, columnNamePK string) (string, error) {
 	for bodyKey, bodyValue := range bodyMap {
 		typeValueFromDB := typesForColumns[bodyKey]
@@ -307,6 +333,52 @@ func findInvalidTypeField(bodyMap map[string]interface{}, typesForColumns map[st
 		}
 	}
 	return "", nil
+}
+
+func rowDeleteHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
+	tableNames, err := getTableList(db)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	reTableName := regexp.MustCompile(`(?P<tablename>\w+)`)
+	matchStrings := reTableName.FindAllString(r.URL.Path, 2)
+	if len(matchStrings) > 0 {
+		currTableName := matchStrings[0]
+		if !contains(tableNames, currTableName) {
+			w.WriteHeader(http.StatusNotFound)
+			responseJson, _ := json.Marshal(SR{
+				"error": "unknown table",
+			})
+			w.Write(responseJson)
+			return
+		}
+		currRowId, err := strconv.Atoi(matchStrings[1])
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		columnNamePK, err := getPrimaryColumnName(db, currTableName)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		countDeleted, err := deleteRow(db, currTableName, columnNamePK, currRowId)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		responseJson, _ := json.Marshal(SR{
+			"response": SR{
+				"deleted": countDeleted,
+			},
+		})
+		w.Write(responseJson)
+		return
+	}
+	w.WriteHeader(http.StatusInternalServerError)
+	return
 }
 
 func rowUpdateHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
@@ -361,7 +433,8 @@ func rowUpdateHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 			w.Write(responseJson)
 			return
 		}
-		idUpdated, err := updateRow(db, currTableName, bodyMap, columnNamePK, currRowId)
+		removeUnknownFields(&bodyMap, typesForColumns)
+		countUpdated, err := updateRow(db, currTableName, bodyMap, columnNamePK, currRowId)
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
@@ -369,7 +442,7 @@ func rowUpdateHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		w.WriteHeader(http.StatusOK)
 		responseJson, _ := json.Marshal(SR{
 			"response": SR{
-				"updated": idUpdated,
+				"updated": countUpdated,
 			},
 		})
 		w.Write(responseJson)
@@ -427,6 +500,8 @@ func rowCreateHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 			w.Write(responseJson)
 			return
 		}
+		removeUnknownFields(&bodyMap, typesForColumns)
+		addFieldToCreate(&bodyMap, typesForColumns)
 		idCreated, err := createRow(db, currTableName, bodyMap)
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
@@ -435,7 +510,7 @@ func rowCreateHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		w.WriteHeader(http.StatusOK)
 		responseJson, _ := json.Marshal(SR{
 			"response": SR{
-				"id": idCreated,
+				fmt.Sprintf(`%s`, columnNamePK): idCreated,
 			},
 		})
 		w.Write(responseJson)
@@ -443,6 +518,19 @@ func rowCreateHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	}
 	w.WriteHeader(http.StatusInternalServerError)
 	return
+}
+
+func deleteRow(db *sql.DB, tableName string, columnNamePK string, currRowId int) (int, error) {
+	result, err := db.Exec(fmt.Sprintf(`DELETE FROM %[1]s WHERE %[2]s=? ;`,
+		tableName, columnNamePK), currRowId)
+	if err != nil {
+		return 0, err
+	}
+	lastAffectedId, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return int(lastAffectedId), nil
 }
 
 func updateRow(db *sql.DB, tableName string, bodyMap map[string]interface{}, columnNamePK string, currRowId int) (int, error) {
@@ -455,7 +543,7 @@ func updateRow(db *sql.DB, tableName string, bodyMap map[string]interface{}, col
 	columnValues = append(columnValues, currRowId)
 	result, err := db.Exec(fmt.Sprintf(`UPDATE %[1]s SET %[2]s WHERE %[3]s=? ;`,
 		tableName,
-		strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(fmt.Sprintf("%s", columnNames), "[", ""), "]", ""), " ", "=?,"),
+		strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(fmt.Sprintf("%s", columnNames), "[", ""), "]", ""), " ", ","),
 		columnNamePK), columnValues...)
 	if err != nil {
 		return 0, err
@@ -542,7 +630,7 @@ func rowDetailHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 
 func mainHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	rePut, _ := regexp.Compile(`/\w+/`)
-	rePost, _ := regexp.Compile(`/\w+/\w+`)
+	rePostDelete, _ := regexp.Compile(`/\w+/\w+`)
 	if r.URL.Path == "/" {
 		tableListHandler(w, r, db)
 	} else if r.Method == "GET" && strings.Count(r.URL.Path, "/") == 1 {
@@ -551,8 +639,10 @@ func mainHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		rowDetailHandler(w, r, db)
 	} else if r.Method == "PUT" && rePut.MatchString(r.URL.Path) {
 		rowCreateHandler(w, r, db)
-	} else if r.Method == "POST" && rePost.MatchString(r.URL.Path) {
+	} else if r.Method == "POST" && rePostDelete.MatchString(r.URL.Path) {
 		rowUpdateHandler(w, r, db)
+	} else if r.Method == "DELETE" && rePostDelete.MatchString(r.URL.Path) {
+		rowDeleteHandler(w, r, db)
 	} else {
 		w.WriteHeader(http.StatusInternalServerError)
 	}
