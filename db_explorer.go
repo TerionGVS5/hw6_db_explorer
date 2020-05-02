@@ -290,7 +290,7 @@ func tableDetailHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	return
 }
 
-func findInvalidTypeField(bodyMap map[string]interface{}, typesForColumns map[string]string) (string, error) {
+func findInvalidTypeField(bodyMap map[string]interface{}, typesForColumns map[string]string, columnNamePK string) (string, error) {
 	for bodyKey, bodyValue := range bodyMap {
 		typeValueFromDB := typesForColumns[bodyKey]
 		_, okByte := bodyValue.(string)
@@ -298,15 +298,85 @@ func findInvalidTypeField(bodyMap map[string]interface{}, typesForColumns map[st
 		_, okInt64 := bodyValue.(int64)
 		_, okFloat32 := bodyValue.(float32)
 		_, okFloat64 := bodyValue.(float64)
-		if (bodyValue == nil && !strings.Contains(typeValueFromDB, "YES")) ||
+		if bodyKey == columnNamePK || (bodyValue == nil && !strings.Contains(typeValueFromDB, "YES")) ||
 			(strings.Contains(typeValueFromDB, "int") && !(okInt32 || okInt64)) ||
 			(strings.Contains(typeValueFromDB, "float") && !(okFloat32 || okFloat64)) ||
-			((strings.Contains(typeValueFromDB, "text") || strings.Contains(typeValueFromDB, "varchar")) && !okByte) {
+			((strings.Contains(typeValueFromDB, "text") || strings.Contains(typeValueFromDB, "varchar")) && !okByte && bodyValue != nil) {
 			return bodyKey, errors.New("invalid type field")
 
 		}
 	}
 	return "", nil
+}
+
+func rowUpdateHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
+	tableNames, err := getTableList(db)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	reTableName := regexp.MustCompile(`(?P<tablename>\w+)`)
+	matchStrings := reTableName.FindAllString(r.URL.Path, 2)
+	if len(matchStrings) > 0 {
+		currTableName := matchStrings[0]
+		if !contains(tableNames, currTableName) {
+			w.WriteHeader(http.StatusNotFound)
+			responseJson, _ := json.Marshal(SR{
+				"error": "unknown table",
+			})
+			w.Write(responseJson)
+			return
+		}
+		currRowId, err := strconv.Atoi(matchStrings[1])
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		body, err := ioutil.ReadAll(r.Body)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		var bodyMap = make(map[string]interface{})
+		err = json.Unmarshal(body, &bodyMap)
+		if err != nil {
+			panic(err)
+		}
+		columnNamePK, err := getPrimaryColumnName(db, currTableName)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		typesForColumns, err := getTypesForColumns(db, currTableName)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		invalidField, err := findInvalidTypeField(bodyMap, typesForColumns, columnNamePK)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			responseJson, _ := json.Marshal(SR{
+				"error": fmt.Sprintf(`field %s have invalid type`, invalidField),
+			})
+			w.Write(responseJson)
+			return
+		}
+		idUpdated, err := updateRow(db, currTableName, bodyMap, columnNamePK, currRowId)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		responseJson, _ := json.Marshal(SR{
+			"response": SR{
+				"updated": idUpdated,
+			},
+		})
+		w.Write(responseJson)
+		return
+	}
+	w.WriteHeader(http.StatusInternalServerError)
+	return
 }
 
 func rowCreateHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
@@ -348,7 +418,7 @@ func rowCreateHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
-		invalidField, err := findInvalidTypeField(bodyMap, typesForColumns)
+		invalidField, err := findInvalidTypeField(bodyMap, typesForColumns, columnNamePK)
 		if err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			responseJson, _ := json.Marshal(SR{
@@ -373,6 +443,28 @@ func rowCreateHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	}
 	w.WriteHeader(http.StatusInternalServerError)
 	return
+}
+
+func updateRow(db *sql.DB, tableName string, bodyMap map[string]interface{}, columnNamePK string, currRowId int) (int, error) {
+	columnNames := make([]string, 0, len(bodyMap))
+	columnValues := make([]interface{}, 0, len(bodyMap))
+	for key, value := range bodyMap {
+		columnNames = append(columnNames, fmt.Sprintf(`%s=?`, key))
+		columnValues = append(columnValues, value)
+	}
+	columnValues = append(columnValues, currRowId)
+	result, err := db.Exec(fmt.Sprintf(`UPDATE %[1]s SET %[2]s WHERE %[3]s=? ;`,
+		tableName,
+		strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(fmt.Sprintf("%s", columnNames), "[", ""), "]", ""), " ", "=?,"),
+		columnNamePK), columnValues...)
+	if err != nil {
+		return 0, err
+	}
+	lastAffectedId, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return int(lastAffectedId), nil
 }
 
 func createRow(db *sql.DB, tableName string, bodyMap map[string]interface{}) (int, error) {
@@ -450,6 +542,7 @@ func rowDetailHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 
 func mainHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	rePut, _ := regexp.Compile(`/\w+/`)
+	rePost, _ := regexp.Compile(`/\w+/\w+`)
 	if r.URL.Path == "/" {
 		tableListHandler(w, r, db)
 	} else if r.Method == "GET" && strings.Count(r.URL.Path, "/") == 1 {
@@ -458,6 +551,8 @@ func mainHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		rowDetailHandler(w, r, db)
 	} else if r.Method == "PUT" && rePut.MatchString(r.URL.Path) {
 		rowCreateHandler(w, r, db)
+	} else if r.Method == "POST" && rePost.MatchString(r.URL.Path) {
+		rowUpdateHandler(w, r, db)
 	} else {
 		w.WriteHeader(http.StatusInternalServerError)
 	}
